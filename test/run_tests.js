@@ -637,6 +637,97 @@ check('checkHealth напоминает настроить уведомлени�
   if (/Уведомления об ошибках выключены/.test(text2)) throw new Error('напоминание осталось после настройки');
 });
 
+/* ===== 15. ОСТАНОВКА И ПАУЗА ===== */
+
+check('пауза: тест не идёт, человек получает ответ, строк не появляется', () => {
+  пауза();
+  post(startMsg());
+  eq(sheet.rows.length, 0, 'строк в таблице');
+  eq(questions(), [], 'вопросов отправлено');
+  const reply = state.sent.filter((s) => /на паузе/.test(s.text || ''));
+  eq(reply.length, 1, 'сообщений о паузе');
+  eq(logSheet.rows[0][1], 'пауза', 'итог в журнале');
+  снятьПаузу();
+});
+
+check('пауза: нажатие кнопки не оставляет часики висеть', () => {
+  post(startMsg());                         // тест начат до паузы
+  пауза();
+  const before = state.sent.length;
+  post(click(0, 1));
+  const after = state.sent.slice(before);
+  eq(after.map((s) => s.method), ['answerCallbackQuery'], 'ответ на нажатие');
+  eq(sheet.rows[0][5], '', 'ответ в таблицу не записан');
+  снятьПаузу();
+});
+
+check('пауза: одинаковые сообщения не превращаются в поток', () => {
+  пауза();
+  for (let i = 0; i < 5; i++) post(startMsg());
+  eq(state.sent.filter((s) => /на паузе/.test(s.text || '')).length, 1, 'сообщений о паузе');
+  eq(logSheet.rows.length, 5, 'в журнале все пять обращений');
+  снятьПаузу();
+});
+
+check('снятьПаузу возвращает бота к работе', () => {
+  пауза();
+  post(startMsg());
+  снятьПаузу();
+  post(startMsg());
+  eq(questions(), ['1'], 'вопрос отправлен после снятия паузы');
+  eq(sheet.rows.length, 1, 'строка создана');
+});
+
+check('текст паузы настраивается', () => {
+  propsStore.set('PAUSE_TEXT', 'Вернёмся в понедельник');
+  пауза();
+  post(startMsg());
+  if (!state.sent.some((s) => /Вернёмся в понедельник/.test(s.text || ''))) {
+    throw new Error('свой текст не использован');
+  }
+  снятьПаузу();
+  propsStore.delete('PAUSE_TEXT');
+});
+
+check('остановитьБота снимает вебхук и сбрасывает очередь', () => {
+  const calls = [];
+  const originalTg = global.tg;
+  global.tg = (method, payload) => { calls.push([method, payload]); return originalTg(method, payload); };
+  остановитьБота();
+  global.tg = originalTg;
+  eq(calls.map((c) => c[0]), ['deleteWebhook'], 'вызванные методы');
+  eq(calls[0][1].drop_pending_updates, true, 'очередь сбрасывается');
+  const log = state.logs.join('\n');
+  if (!/Бот остановлен/.test(log)) throw new Error('нет подтверждения:\n' + log);
+  if (!/запуститьБота/.test(log)) throw new Error('не сказано, как включить обратно');
+});
+
+check('остановитьБота сообщает о неудаче, а не молчит', () => {
+  const originalTg = global.tg;
+  global.tg = (method) => {
+    if (method === 'deleteWebhook') return JSON.stringify({ ok: false, description: 'Unauthorized' });
+    return originalTg(method);
+  };
+  остановитьБота();
+  global.tg = originalTg;
+  const log = state.logs.join('\n');
+  if (!/НЕ УДАЛОСЬ снять вебхук/.test(log)) throw new Error('сбой не показан:\n' + log);
+  if (!/Unauthorized/.test(log)) throw new Error('нет причины отказа');
+});
+
+check('/diag и проверка() показывают паузу', () => {
+  пауза();
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  post({ update_id: ++uid, message: { chat: { id: CHAT }, from: { id: CHAT }, text: '/diag' } });
+  // На паузе /diag тоже не выполняется — это ожидаемо, состояние смотрим в редакторе.
+  const text = checkHealth();
+  if (!/БОТ НА ПАУЗЕ/.test(text)) throw new Error('пауза не показана:\n' + text);
+  if (!/снятьПаузу/.test(text)) throw new Error('не сказано, как снять');
+  снятьПаузу();
+  const text2 = checkHealth();
+  if (/БОТ НА ПАУЗЕ/.test(text2)) throw new Error('пауза показана после снятия');
+});
+
 const failed = results.filter((r) => r[0] === 'FAIL');
 realLog('');
 results.forEach(([st, name, msg]) =>

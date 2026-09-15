@@ -156,6 +156,13 @@ function doPost(e) {
       return ok;
     }
 
+    if (PropertiesService.getScriptProperties().getProperty('PAUSED') === 'on') {
+      ctx.plan = 'пауза';
+      pauseReply_(update, ctx.chatId);
+      logUpdate_(ctx, 'пауза', t0, 'свойство PAUSED = on, снять: снятьПаузу()');
+      return ok;
+    }
+
     var plan = planUpdate_(update);
     if (!plan) {
       logUpdate_(ctx, 'пропущен', t0,
@@ -621,6 +628,79 @@ function resetBot() {
   console.log('Подробная проверка: функция checkHealth');
 }
 
+/**
+ * ОСТАНОВИТЬ БОТА. Снимает вебхук: Telegram перестаёт вызывать скрипт.
+ * Код, таблица и настройки остаются на месте, обновления не копятся в очереди.
+ * Включить обратно: запуститьБота().
+ */
+function остановитьБота() {
+  var res = jsonOf_(tg('deleteWebhook', { drop_pending_updates: true }));
+  if (res && res.ok) {
+    console.log('Бот остановлен: вебхук снят, очередь обновлений сброшена.');
+    console.log('Код и таблица не тронуты. Включить обратно: запуститьБота() — то же, что resetBot().');
+  } else {
+    console.log('НЕ УДАЛОСЬ снять вебхук: ' + descriptionOf_(res));
+    console.log('Проверьте TOKEN. Состояние вебхука: webhookInfo()');
+  }
+  return res;
+}
+
+/** ВКЛЮЧИТЬ БОТА обратно. То же, что resetBot(). */
+function запуститьБота() {
+  return resetBot();
+}
+
+/**
+ * ПАУЗА без снятия вебхука. Бот продолжает отвечать, но не ведёт тест:
+ * на любое обращение приходит короткое сообщение, строки в таблицу не пишутся.
+ *
+ * Так лучше для живой воронки: человек, пришедший из ролика, получает ответ,
+ * а не тишину. Текст задаётся свойством PAUSE_TEXT.
+ */
+function пауза() {
+  PropertiesService.getScriptProperties().setProperty('PAUSED', 'on');
+  console.log('Бот на паузе. Отвечает: «' + pauseText_() + '»');
+  console.log('Снять: снятьПаузу(). Текст меняется свойством PAUSE_TEXT.');
+  return true;
+}
+
+function снятьПаузу() {
+  PropertiesService.getScriptProperties().deleteProperty('PAUSED');
+  console.log('Пауза снята, тест снова работает.');
+  return true;
+}
+
+function pauseText_() {
+  return PropertiesService.getScriptProperties().getProperty('PAUSE_TEXT') ||
+    'Тест сейчас на паузе — обновляем материалы. Зайдите чуть позже и нажмите /start.';
+}
+
+/**
+ * Ответ на паузе. Не чаще одного сообщения в 5 минут на человека:
+ * иначе частые нажатия превратятся в поток одинаковых сообщений.
+ */
+function pauseReply_(update, chatId) {
+  try {
+    if (update.callback_query) {
+      // Кнопке нужен ответ всегда, иначе «часики» висят до таймаута.
+      tgAsync([['answerCallbackQuery', {
+        callback_query_id: update.callback_query.id,
+        text: pauseText_(),
+        show_alert: true
+      }]]);
+      return;
+    }
+    if (!chatId) return;
+    var cache = CacheService.getScriptCache();
+    var key = 'pause' + chatId;
+    if (cache.get(key)) return;
+    cache.put(key, '1', 300);
+    send(chatId, pauseText_());
+  } catch (err) {
+    console.error('ответ на паузе не отправлен: ' + errText_(err));
+  }
+}
+
 /** Диагностика. pending_update_count > 0 и last_error_message — очередь повторов. */
 function webhookInfo() {
   var info = tg('getWebhookInfo', {});
@@ -771,6 +851,11 @@ function checkHealth() {
 
   out('=== ПРОВЕРКА БОТА ===');
   out('в редакторе: версия ' + CODE_VERSION + ', сборка ' + BUILD_STAMP);
+  if (sp.getProperty('PAUSED') === 'on') {
+    out('');
+    out('БОТ НА ПАУЗЕ: тест не идёт, на обращения приходит короткий ответ.');
+    out('Снять паузу: снятьПаузу()');
+  }
   out('');
 
   // 1. Токен
@@ -1156,6 +1241,7 @@ function diagText_(chatId) {
     'строка в таблице: ' + (row || 'нет') + '\n' +
     'уровень журнала: ' + logLevel_() + '\n' +
     'уведомления об ошибках: ' + alertsState_() + '\n' +
+    'пауза: ' + (PropertiesService.getScriptProperties().getProperty('PAUSED') === 'on' ? 'включена' : 'нет') + '\n' +
     'время: ' + nowText_();
 }
 
