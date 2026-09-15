@@ -1,61 +1,47 @@
 /**
- * Прогон логики бота на заглушках Apps Script.
+ * Прогон логики бота версии 4 на заглушках Apps Script.
  * Запуск: node test/run_tests.js
  */
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { stats, sheet, scriptProps, cache, realLog } = require('./gas_stubs');
+const { state, sheet, propsStore, cacheStore, reset, realLog } = require('./stubs');
 
-// Загружаем .gs как обычный JS — порядок конкатенации как в проекте Apps Script.
-// Косвенный eval, чтобы объявления попали в глобальную область, как в Apps Script.
-const srcDir = path.join(__dirname, '..', 'src');
-const sources = fs.readdirSync(srcDir).filter((f) => f.endsWith('.gs')).sort()
-  .map((f) => fs.readFileSync(path.join(srcDir, f), 'utf8')).join('\n;\n');
+// Косвенный eval: объявления должны попасть в глобальную область, как в Apps Script.
 const globalEval = eval;
-globalEval(sources);
+globalEval(fs.readFileSync(path.join(__dirname, '..', 'src', 'Code.gs'), 'utf8'));
 
-let updateId = 5000;
 const CHAT = 401084071;
+let uid = 9000;
 
-function post(update, secret = 'sekret') {
-  return doPost({ parameter: { s: secret }, postData: { contents: JSON.stringify(update) } });
-}
-function startUpdate(payload) {
-  return {
-    update_id: ++updateId,
-    message: {
-      message_id: 1, chat: { id: CHAT },
-      from: { id: CHAT, username: 'Rick_Styler', first_name: 'Sergei' },
-      text: payload ? `/start ${payload}` : '/start'
-    }
-  };
-}
-function clickUpdate(step, idx, messageId) {
-  return {
-    update_id: ++updateId,
-    callback_query: {
-      id: 'cb' + updateId, from: { id: CHAT, username: 'Rick_Styler', first_name: 'Sergei' },
-      message: { message_id: messageId, chat: { id: CHAT } },
-      data: `a|${step}|${idx}`
-    }
-  };
-}
-function lastQuestionMessageId() {
-  const sent = stats.sent.filter((s) => s.method === 'sendMessage');
-  return sent.length ? 1000 + sent.length : null;
-}
-function reset() {
-  sheet.rows.clear();
-  cache.clear();
-  [...scriptProps.keys()].forEach((k) => { if (k !== 'BOT_TOKEN' && k !== 'WEBHOOK_SECRET') scriptProps.delete(k); });
-  stats.sent.length = 0; stats.logs.length = 0;
-  stats.fetch = 0; stats.fetchAll = 0; stats.sheetOpens = 0; stats.ranges = 0;
-}
+const post = (update, secret = 'sekret') =>
+  doPost({ parameter: { s: secret }, postData: { contents: JSON.stringify(update) } });
+
+const startMsg = (payload) => ({
+  update_id: ++uid,
+  message: {
+    chat: { id: CHAT },
+    from: { id: CHAT, username: 'Rick_Styler', first_name: 'Sergei' },
+    text: payload ? '/start ' + payload : '/start'
+  }
+});
+const click = (step, choice, chatId = CHAT) => ({
+  update_id: ++uid,
+  callback_query: {
+    id: 'cb' + uid, from: { id: chatId, username: 'Rick_Styler', first_name: 'Sergei' },
+    message: { message_id: 50, chat: { id: chatId } },
+    data: step + ':' + choice
+  }
+});
+const questions = () => state.sent
+  .filter((s) => s.method === 'sendMessage' && /из 5/.test(s.text || ''))
+  .map((s) => s.text.match(/(\d) из 5/)[1]);
+const row = () => sheet.rows[0];
 
 const results = [];
 function check(name, fn) {
   reset();
+  global._sheet = null;
   try { fn(); results.push(['PASS', name, '']); }
   catch (err) { results.push(['FAIL', name, err.message]); }
 }
@@ -63,172 +49,282 @@ function eq(actual, expected, what) {
   const a = JSON.stringify(actual), b = JSON.stringify(expected);
   if (a !== b) throw new Error(`${what}: получено ${a}, ожидалось ${b}`);
 }
-function questionsSent() {
-  return stats.sent.filter((s) => s.method === 'sendMessage' && /^\d\/5\./.test(s.text)).map((s) => s.text.slice(0, 4));
-}
 
-/* 1. Исходный баг: одна и та же доставка апдейта 54 раза. */
-check('повторная доставка одного update_id не плодит строки и вопросы', () => {
-  const upd = startUpdate();
+/* ===== 1. ГЛАВНОЕ: сценарий зависания после второго вопроса ===== */
+check('нажатие во время записи строки не ломает тест (баг v3)', () => {
+  // Пока appendRow пишет строку, пользователь жмёт вариант первого вопроса.
+  state.onSlowSheetWrite = () => post(click(0, 1));
+  post(startMsg());
+
+  const st = JSON.parse(cacheStore.get('st' + CHAT));
+  eq(st.step, 1, 'шаг после ответа на первый вопрос');
+  eq(st.answers, [1], 'ответы не стёрты');
+  eq(questions(), ['1', '2'], 'отправленные вопросы');
+
+  // Дальше тест должен идти, а не замирать.
+  post(click(1, 1));
+  eq(questions(), ['1', '2', '3'], 'третий вопрос пришёл');
+  post(click(2, 1));
+  post(click(3, 0));
+  post(click(4, 0));
+  eq(sheet.rows.length, 1, 'строк в таблице');
+  eq(row()[12], 'завершил', 'статус');
+  eq(row().slice(5, 10),
+     ['5–6 класс', 'Ребёнок сам', 'Прошу ребёнка объяснить своими словами',
+      'Перестанет думать сам', 'Да, и не раз'],
+     'все пять ответов записаны');
+});
+
+/* ===== 2. повторная доставка одного и того же апдейта ===== */
+check('повторная доставка update_id не плодит строк и вопросов', () => {
+  const upd = startMsg();
   for (let i = 0; i < 54; i++) post(upd);
-  eq(sheet.dataRows().length, 1, 'строк в таблице');
-  eq(questionsSent(), ['1/5.'], 'отправленных вопросов');
+  eq(sheet.rows.length, 1, 'строк в таблице');
+  eq(questions(), ['1'], 'вопросов отправлено');
 });
 
-/* 2. Обработчик упал — вебхук всё равно должен ответить 200. */
-check('doPost отвечает ok даже когда обработчик падает', () => {
-  const original = global.handleMessage_;
-  global.handleMessage_ = () => { throw new Error('внутренний сбой'); };
-  const out = post(startUpdate());
-  global.handleMessage_ = original;
-  eq(out.getContent(), 'ok', 'тело ответа');
+check('повторная доставка нажатия не сдвигает шаг дважды', () => {
+  post(startMsg());
+  const c = click(0, 2);
+  post(c); post(c); post(c);
+  eq(JSON.parse(cacheStore.get('st' + CHAT)).step, 1, 'шаг');
+  eq(questions(), ['1', '2'], 'вопросов отправлено');
 });
 
-/* 3. Полный проход теста. */
-check('полный проход: 5 вопросов, одна строка, статус «прошёл»', () => {
-  post(startUpdate('yt_shorts'));
-  const answers = [1, 0, 0, 1, 1];
-  answers.forEach((idx, step) => post(clickUpdate(step, idx, lastQuestionMessageId())));
-  const rows = sheet.dataRows();
-  eq(rows.length, 1, 'строк в таблице');
-  const r = rows[0];
-  eq(questionsSent(), ['1/5.', '2/5.', '3/5.', '4/5.', '5/5.'], 'вопросы по одному разу');
-  eq(r[1], String(CHAT), 'chat_id');
+/* ===== 3. полный проход ===== */
+check('полный проход: одна строка, все поля, статус «завершил»', () => {
+  post(startMsg('yt_shorts'));
+  [1, 1, 3, 1, 0].forEach((c, i) => post(click(i, c)));
+  eq(sheet.rows.length, 1, 'строк в таблице');
+  const r = row();
+  eq(questions(), ['1', '2', '3', '4', '5'], 'каждый вопрос по одному разу');
+  eq(String(r[1]), String(CHAT), 'chat_id');
   eq(r[2], '@Rick_Styler', 'username');
-  eq(r[4], 'yt_shorts', 'Источник из deep link');
+  eq(r[4], 'yt_shorts', 'источник из deep link');
   eq(r[5], '5–6 класс', 'Класс');
   eq(r[6], 'Ребёнок сам', 'Кто пользуется');
-  eq(r[7], 'Никак не проверяю', 'Проверка');
-  eq(r[8], 'Не понимаю, сам сделал или нет', 'Тревога');
-  eq(r[9], 'Подозреваю, но не проверял(а)', 'Ошибки');
-  eq(r[10], 'Б (контролёр)', 'Сегмент');
-  eq(r[11], 'красная', 'Зона');
-  eq(r[12], 'прошёл', 'Статус');
+  eq(r[7], 'Не проверяю, времени нет', 'Проверка');
+  eq(r[8], 'Сдаст чужую ошибку под своим именем', 'Тревога');
+  eq(r[9], 'Да, и не раз', 'Ошибки');
+  eq(r[10], 'Контролёр', 'Сегмент');
+  eq(r[11], 'Красная', 'Зона');
+  eq(r[12], 'завершил', 'Статус');
   if (!r[13]) throw new Error('Дата финиша пустая');
+  eq(cacheStore.has('st' + CHAT), false, 'состояние очищено после финиша');
 });
 
-/* 4. Старая кнопка из уже отвеченного вопроса. */
-check('повторное нажатие старой кнопки не повторяет вопрос', () => {
-  post(startUpdate());
-  const mid = lastQuestionMessageId();
-  post(clickUpdate(0, 1, mid));
-  for (let i = 0; i < 5; i++) post(clickUpdate(0, 2, mid));   // жмём первый вопрос ещё раз
-  eq(questionsSent(), ['1/5.', '2/5.'], 'вопросы');
-  eq(sheet.dataRows()[0][5], '5–6 класс', 'ответ не перезаписан поздним нажатием');
+/* ===== 4. повторный /start ===== */
+check('/start на нулевом шаге возобновляет, а не создаёт вторую строку', () => {
+  post(startMsg());
+  post(startMsg());
+  post(startMsg());
+  eq(sheet.rows.length, 1, 'строк в таблице');
+  eq(questions(), ['1', '1', '1'], 'первый вопрос повторён без новых строк');
+  const resumed = state.sent.filter((s) => /Продолжаем с того места/.test(s.text || ''));
+  eq(resumed.length, 2, 'сообщений о возобновлении');
 });
 
-/* 5. Повторный /start. */
-check('повторный /start не создаёт вторую строку и сбрасывает ответы', () => {
-  post(startUpdate());
-  post(clickUpdate(0, 2, lastQuestionMessageId()));
-  eq(sheet.dataRows()[0][5], '7–9 класс', 'ответ записан');
-  post(startUpdate());
-  const rows = sheet.dataRows();
-  eq(rows.length, 1, 'строк в таблице');
-  eq(rows[0][5], '', 'Класс очищен');
-  eq(rows[0][12], 'начал', 'Статус сброшен');
+check('/start посреди теста возобновляет с текущего вопроса', () => {
+  post(startMsg());
+  post(click(0, 2));
+  post(startMsg());
+  eq(questions(), ['1', '2', '2'], 'возобновление со второго вопроса');
+  eq(sheet.rows.length, 1, 'строк в таблице');
+  eq(JSON.parse(cacheStore.get('st' + CHAT)).step, 1, 'шаг сохранён');
 });
 
-/* 6. Свободный текст. */
-check('произвольный текст не создаёт строк и не сдвигает шаг', () => {
-  post(startUpdate());
-  const before = JSON.stringify(sheet.dataRows());
+check('/start после завершения переиспользует строку', () => {
+  post(startMsg());
+  [0, 1, 1, 1, 0].forEach((c, i) => post(click(i, c)));
+  eq(row()[12], 'завершил', 'статус после первого прохода');
+  post(startMsg());
+  eq(sheet.rows.length, 1, 'строк в таблице');
+  eq(row()[12], 'начал', 'статус сброшен');
+  eq(row()[5], '', 'ответы очищены');
+});
+
+/* ===== 5. старые и битые кнопки ===== */
+check('нажатие на уже отвеченный вопрос не повторяет вопрос', () => {
+  post(startMsg());
+  post(click(0, 1));
+  for (let i = 0; i < 5; i++) post(click(0, 3));
+  eq(questions(), ['1', '2'], 'вопросов отправлено');
+  eq(JSON.parse(cacheStore.get('st' + CHAT)).answers, [1], 'ответ не перезаписан');
+});
+
+check('битые callback_data не ломают обработчик', () => {
+  post(startMsg());
+  ['abc', '0:99', '9:0', ':', '0'].forEach((data) => {
+    post({ update_id: ++uid, callback_query: { id: 'x' + uid, from: { id: CHAT },
+      message: { message_id: 50, chat: { id: CHAT } }, data } });
+  });
+  eq(JSON.parse(cacheStore.get('st' + CHAT)).step, 0, 'шаг не сдвинулся');
+  eq(questions(), ['1'], 'вопросов отправлено');
+});
+
+check('нажатие без состояния подсказывает /start', () => {
+  post(click(0, 1));
+  const hint = state.sent.filter((s) => /тест сбросился/.test(s.text || ''));
+  eq(hint.length, 1, 'подсказок отправлено');
+  eq(sheet.rows.length, 0, 'строк в таблице');
+});
+
+/* ===== 6. сбой отправки ===== */
+check('если вопрос не ушёл, шаг откатывается и диалог не замирает', () => {
+  post(startMsg());
+  state.failSendMessage = true;
+  post(click(0, 1));
+  state.failSendMessage = false;
+
+  eq(JSON.parse(cacheStore.get('st' + CHAT)).step, 0, 'шаг откатан');
+  // Та же кнопка снова работает — диалог живой.
+  post(click(0, 1));
+  eq(questions().slice(-1), ['2'], 'второй вопрос пришёл после повтора');
+});
+
+/* ===== 7. прочий ввод и секрет ===== */
+check('произвольный текст не создаёт строк', () => {
+  post(startMsg());
   for (let i = 0; i < 3; i++) {
-    post({ update_id: ++updateId, message: { message_id: 9, chat: { id: CHAT }, from: { id: CHAT }, text: 'привет' } });
+    post({ update_id: ++uid, message: { chat: { id: CHAT }, from: { id: CHAT }, text: 'привет' } });
   }
-  eq(JSON.stringify(sheet.dataRows()), before, 'таблица не изменилась');
-  eq(questionsSent(), ['1/5.'], 'вопрос не повторён');
-  eq(JSON.parse(scriptProps.get('st_' + CHAT)).step, 0, 'шаг не сдвинулся');
+  eq(sheet.rows.length, 1, 'строк в таблице');
+  eq(questions(), ['1'], 'вопросов отправлено');
+  eq(JSON.parse(cacheStore.get('st' + CHAT)).step, 0, 'шаг не сдвинулся');
 });
 
-/* 7. Секрет вебхука. */
-check('запрос без правильного секрета отбрасывается', () => {
-  post(startUpdate(), 'wrong');
-  eq(sheet.dataRows().length, 0, 'строк в таблице');
-  eq(stats.sent.length, 0, 'сообщений отправлено');
+check('запрос с чужим секретом отбрасывается', () => {
+  post(startMsg(), 'wrong');
+  eq(sheet.rows.length, 0, 'строк в таблице');
+  eq(state.sent.length, 0, 'сообщений отправлено');
 });
 
-/* 8. Цена одного нажатия. */
-check('одно нажатие кнопки = не больше 2 сетевых раундтрипов', () => {
-  post(startUpdate());
-  const f0 = stats.fetch, fa0 = stats.fetchAll;
-  post(clickUpdate(0, 1, lastQuestionMessageId()));
-  const roundtrips = (stats.fetch - f0) + (stats.fetchAll - fa0);
-  if (roundtrips > 2) throw new Error('раундтрипов: ' + roundtrips);
+check('без настроенного секрета бот продолжает работать', () => {
+  propsStore.delete('WEBHOOK_SECRET');
+  post(startMsg(), undefined);
+  eq(questions(), ['1'], 'вопрос отправлен');
+  propsStore.set('WEBHOOK_SECRET', 'sekret');
 });
 
-/* 9. Индекс строки не требует чтения всего листа. */
-check('второй пользователь не заставляет перечитывать лист целиком', () => {
-  post(startUpdate());
-  const other = { update_id: ++updateId, message: { message_id: 2, chat: { id: 777 }, from: { id: 777, username: 'x', first_name: 'X' }, text: '/start' } };
-  post(other);
-  eq(sheet.dataRows().length, 2, 'строк в таблице');
-  const ranges0 = stats.ranges;
-  post(clickUpdate(0, 1, lastQuestionMessageId()));
-  if (stats.ranges - ranges0 > 4) throw new Error('обращений к диапазонам: ' + (stats.ranges - ranges0));
+/* ===== 8. цена запроса ===== */
+check('одно нажатие = не больше 2 обращений к Bot API', () => {
+  post(startMsg());
+  const f = state.fetch + state.fetchAll;
+  post(click(0, 1));
+  const spent = state.fetch + state.fetchAll - f;
+  if (spent > 2) throw new Error('обращений: ' + spent);
 });
 
-/* 10. Склейка уже накопленных дублей. */
+check('блокировка не держится во время сети и таблицы', () => {
+  // Если бы блокировка удерживалась, вложенный вызов получил бы false
+  // и нажатие было бы потеряно — именно это ломало бота.
+  state.onSlowSheetWrite = () => {
+    if (state.lockHeld) throw new Error('блокировка удерживается во время записи в лист');
+    post(click(0, 0));
+  };
+  post(startMsg());
+  eq(questions(), ['1', '2'], 'нажатие обработано во время записи строки');
+});
+
+/* ===== 9. два пользователя ===== */
+check('два пользователя не мешают друг другу', () => {
+  const OTHER = 777;
+  post(startMsg());
+  post({ update_id: ++uid, message: { chat: { id: OTHER },
+    from: { id: OTHER, username: 'other', first_name: 'Other' }, text: '/start' } });
+  post(click(0, 0));
+  post(click(0, 3, OTHER));
+  eq(sheet.rows.length, 2, 'строк в таблице');
+  const mine = sheet.rows.find((r) => String(r[1]) === String(CHAT));
+  const theirs = sheet.rows.find((r) => String(r[1]) === String(OTHER));
+  eq(mine[5], '1–4 класс', 'ответ первого пользователя');
+  eq(theirs[5], '10–11 класс', 'ответ второго пользователя');
+  eq(propsStore.get('r' + CHAT), '2', 'номер строки первого');
+  eq(propsStore.get('r' + OTHER), '3', 'номер строки второго');
+});
+
+/* ===== 10. обслуживание ===== */
 check('dedupeSheet склеивает дубли и сохраняет ответы', () => {
-  const header = CFG.HEADERS;
-  sheet.getRange(1, 1, 1, header.length).setValues([header]);
-  const mk = (t, klass, kto) => ['15.09.2026 ' + t, String(CHAT), '@Rick_Styler', 'Sergei', 'прямой', klass, kto, '', '', '', '', '', 'начал', '', ''];
-  const rows = [mk('14:41:54', '', ''), mk('14:42:09', '7–9 класс', ''), mk('14:44:18', '', 'Пока никто'), mk('14:47:23', '5–6 класс', 'Ребёнок сам')];
-  rows.forEach((r, i) => sheet.getRange(i + 2, 1, 1, header.length).setValues([r]));
-  sheet.getRange(6, 1, 1, header.length).setValues([mk('15:00:00', '10–11 класс', 'Вместе').map((v, i) => (i === 1 ? '777' : v))]);
+  const mk = (t, klass, kto, chat = CHAT) => [t, String(chat), '@Rick_Styler', 'Sergei',
+    'прямой', klass, kto, '', '', '', '', '', 'начал', '', ''];
+  sheet.rows.push(mk('14:41:54', '', ''));
+  sheet.rows.push(mk('14:42:09', '7–9 класс', ''));
+  sheet.rows.push(mk('14:44:18', '', 'Пока никто'));
+  sheet.rows.push(mk('14:47:23', '5–6 класс', 'Ребёнок сам'));
+  sheet.rows.push(mk('15:00:00', '10–11 класс', 'Оба', 777));
 
   const dry = dedupeSheet();
-  eq(dry.duplicates, 3, 'дублей найдено (пробный прогон)');
-  eq(sheet.dataRows().length, 5, 'пробный прогон ничего не удалил');
+  eq(dry.duplicates, 3, 'дублей найдено');
+  eq(sheet.rows.length, 5, 'пробный прогон ничего не удалил');
 
   dedupeSheet(true);
-  const after = sheet.dataRows();
-  eq(after.length, 2, 'строк осталось');
-  const mine = after.find((r) => String(r[1]) === String(CHAT));
+  eq(sheet.rows.length, 2, 'строк осталось');
+  const mine = sheet.rows.find((r) => String(r[1]) === String(CHAT));
+  eq(mine[0], '14:41:54', 'дата старта самая ранняя');
   eq(mine[5], '5–6 класс', 'Класс поднят из дубля');
   eq(mine[6], 'Ребёнок сам', 'Кто пользуется поднят из дубля');
-  eq(mine[0], '15.09.2026 14:41:54', 'дата старта осталась самой ранней');
-  eq(scriptProps.get('r_' + CHAT), '2', 'индекс строки пересобран');
+  eq(propsStore.get('r' + CHAT), '2', 'номера строк пересобраны');
+  eq(propsStore.get('r777'), '3', 'номер строки второго пользователя');
 });
 
-/* 11. Чистая логика зон и сегментов. */
+check('очиститьТаблицу сбрасывает номера строк и состояния', () => {
+  post(startMsg());
+  post(click(0, 1));
+  if (!propsStore.get('r' + CHAT)) throw new Error('номер строки не сохранён');
+  очиститьТаблицу();
+  eq(sheet.rows.length, 0, 'строк в таблице');
+  eq(propsStore.has('r' + CHAT), false, 'номер строки удалён');
+  eq(cacheStore.has('st' + CHAT), false, 'состояние сброшено');
+  // После очистки бот должен нормально начать заново.
+  post(startMsg());
+  eq(sheet.rows.length, 1, 'новая строка создана');
+  eq(questions().slice(-1), ['1'], 'первый вопрос отправлен');
+});
+
 check('selfTest без ошибок', () => { eq(selfTest(), [], 'ошибки selfTest'); });
 
-/* 12. Все кнопки доходят до записи. */
+/* ===== 11. все комбинации ответов ===== */
 check('любая комбинация ответов даёт заполненную строку', () => {
-  let combos = 0;
-  for (let a = 0; a < 4; a++) for (let b = 0; b < 4; b++) {
-    reset();
-    post(startUpdate());
-    [a, b, (a + b) % 4, a, b].forEach((idx, step) => post(clickUpdate(step, idx, lastQuestionMessageId())));
-    const r = sheet.dataRows()[0];
-    for (let c = 5; c <= 11; c++) if (r[c] === '') throw new Error(`пустой столбец ${c} при ${a}/${b}`);
-    if (r[12] !== 'прошёл') throw new Error('статус не «прошёл»');
-    combos++;
+  let n = 0;
+  for (let a = 0; a < 4; a++) {
+    for (let b = 0; b < 4; b++) {
+      for (let c = 0; c < 4; c++) {
+        reset(); global._sheet = null;
+        post(startMsg());
+        [a, b, c, a, b].forEach((choice, i) => post(click(i, choice)));
+        const r = sheet.rows[0];
+        for (let col = 5; col <= 11; col++) {
+          if (r[col] === '') throw new Error(`пустой столбец ${col + 1} при ${a}/${b}/${c}`);
+        }
+        if (r[12] !== 'завершил') throw new Error('статус не «завершил» при ' + [a, b, c]);
+        n++;
+      }
+    }
   }
-  if (combos !== 16) throw new Error('комбинаций проверено: ' + combos);
+  eq(n, 64, 'комбинаций проверено');
 });
 
-/* 13. Блокировка освобождается даже после исключения в обработчике. */
-check('после сбоя блокировка освобождается и следующий апдейт обрабатывается', () => {
-  const original = global.handleMessage_;
-  global.handleMessage_ = () => { throw new Error('внутренний сбой'); };
-  post(startUpdate());
-  global.handleMessage_ = original;
-  post(startUpdate());
-  eq(sheet.dataRows().length, 1, 'строк в таблице');
-  eq(questionsSent(), ['1/5.'], 'вопрос отправлен один раз');
-});
-
-/* 14. /start укладывается в один раундтрип к Bot API. */
-check('/start = один раундтрип к Bot API', () => {
-  post(startUpdate());
-  eq(stats.fetch + stats.fetchAll, 1, 'раундтрипов на /start');
-  eq(questionsSent(), ['1/5.'], 'первый вопрос отправлен');
+/* ===== 12. восстановление потерянных записей ===== */
+check('финиш дописывает ответы, не попавшие в лист по ходу теста', () => {
+  post(startMsg());
+  post(click(0, 1));
+  // Имитируем потерю номера строки посреди теста.
+  propsStore.delete('r' + CHAT);
+  const saved = sheet.rows[0][1];
+  sheet.rows[0][1] = '';                   // строку по chat_id больше не найти
+  post(click(1, 1));
+  post(click(2, 1));
+  sheet.rows[0][1] = saved;                // строка снова находится
+  post(click(3, 1));
+  post(click(4, 1));
+  const r = sheet.rows[0];
+  eq(r.slice(5, 10).filter(String).length, 5, 'все пять ответов на месте');
+  eq(r[12], 'завершил', 'статус');
 });
 
 const failed = results.filter((r) => r[0] === 'FAIL');
 realLog('');
-results.forEach(([st, name, msg]) => realLog(`  ${st === 'PASS' ? '✓' : '✗'} ${name}${msg ? '\n      ' + msg : ''}`));
+results.forEach(([st, name, msg]) =>
+  realLog(`  ${st === 'PASS' ? '✓' : '✗'} ${name}${msg ? '\n      ' + msg : ''}`));
 realLog(`\n${results.length - failed.length}/${results.length} тестов прошли\n`);
 process.exit(failed.length ? 1 : 0);
