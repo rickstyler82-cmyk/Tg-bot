@@ -47,6 +47,11 @@ var COL_FIRST_ANSWER = 6;
 // По ней сразу понятно, обновлено ли развёртывание.
 var CODE_VERSION = '4.1';
 
+// Отметку ставит scripts/deploy.sh перед отправкой кода: дата и хеш коммита.
+// По ней развёрнутый код сверяется с локальным точно, а не с точностью до
+// номера версии — одна и та же версия могла быть собрана из разного кода.
+var BUILD_STAMP = 'развёрнуто вручную';
+
 var LOG_SHEET_NAME = 'Журнал';
 var LOG_HEADERS = ['Время', 'Итог', 'update_id', 'chat_id', 'Событие', 'Шаг', 'Мс', 'Подробности', 'Версия'];
 var LOG_KEEP_ROWS = 2000;   // сверх этого самые старые строки удаляются
@@ -179,7 +184,7 @@ function doPost(e) {
  * Полный отчёт: ?k=<WEBHOOK_SECRET>
  */
 function doGet(e) {
-  var report = { версия_кода: CODE_VERSION, время: nowText_() };
+  var report = { версия_кода: CODE_VERSION, отметка_сборки: BUILD_STAMP, время: nowText_() };
   try {
     var sp = PropertiesService.getScriptProperties();
     var secret = sp.getProperty('WEBHOOK_SECRET');
@@ -764,7 +769,8 @@ function checkHealth() {
   var problems = [];
   var out = function (t) { lines.push(t); };
 
-  out('=== ПРОВЕРКА БОТА, версия кода в редакторе: ' + CODE_VERSION + ' ===');
+  out('=== ПРОВЕРКА БОТА ===');
+  out('в редакторе: версия ' + CODE_VERSION + ', сборка ' + BUILD_STAMP);
   out('');
 
   // 1. Токен
@@ -797,8 +803,15 @@ function checkHealth() {
   } else if (live.version !== CODE_VERSION) {
     out('   развёрнута ' + live.version + ', в редакторе ' + CODE_VERSION);
     problems.push('РАЗВЁРНУТА СТАРАЯ ВЕРСИЯ. Развернуть → Управление развёртываниями → карандаш → Версия: Новая');
+  } else if (live.stamp && live.stamp !== BUILD_STAMP) {
+    out('   версия совпадает, но сборка другая');
+    out('   развёрнута сборка: ' + live.stamp);
+    out('   в редакторе:       ' + BUILD_STAMP);
+    problems.push('РАЗВЁРНУТ ДРУГОЙ КОД той же версии. Сделайте новое развёртывание ' +
+                  '(или npm run deploy, если настроено автоматическое развёртывание)');
   } else {
-    out('   развёрнута ' + live.version + ' — совпадает с редактором');
+    out('   развёрнута версия ' + live.version + ', сборка ' + (live.stamp || BUILD_STAMP) +
+        ' — совпадает с редактором');
   }
 
   // 3. Вебхук
@@ -938,9 +951,14 @@ function liveVersion_(base) {
     var body = res.getContentText();
     var parsed = null;
     try { parsed = JSON.parse(body); } catch (err) { parsed = null; }
-    return { version: parsed ? parsed['версия_кода'] : '', body: body, error: '' };
+    return {
+      version: parsed ? parsed['версия_кода'] : '',
+      stamp: parsed ? parsed['отметка_сборки'] : '',
+      body: body,
+      error: ''
+    };
   } catch (err) {
-    return { version: '', body: '', error: errText_(err) };
+    return { version: '', stamp: '', body: '', error: errText_(err) };
   }
 }
 
@@ -1132,6 +1150,7 @@ function diagText_(chatId) {
   try { row = rowOf_(chatId); } catch (err) { row = 0; }
   return 'Диагностика\n' +
     'версия кода: ' + CODE_VERSION + '\n' +
+    'сборка: ' + BUILD_STAMP + '\n' +
     'ваш chat_id: ' + chatId + '\n' +
     'шаг теста: ' + (state ? state.step : 'состояния нет') + '\n' +
     'строка в таблице: ' + (row || 'нет') + '\n' +

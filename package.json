@@ -1,0 +1,26 @@
+{
+  "name": "tg-bot-ai-and-kids",
+  "version": "4.1.0",
+  "private": true,
+  "description": "Telegram-бот лид-магнита проекта «ИИ и дети» на Google Apps Script",
+  "scripts": {
+    "test": "node test/run_tests.js && node test/test_deploy_tools.mjs",
+    "repro": "node test/repro_freeze.js",
+    "login": "clasp login",
+    "pull": "clasp pull",
+    "push": "clasp push -f",
+    "deploy": "node scripts/deploy.mjs",
+    "verify": "node scripts/verify.mjs",
+    "deployments": "clasp list-deployments",
+    "logs": "clasp tail-logs --simplified",
+    "open": "clasp open-script",
+    "test:bot": "node test/run_tests.js",
+    "test:tools": "node test/test_deploy_tools.mjs"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.4.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
