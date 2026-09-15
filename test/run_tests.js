@@ -5,7 +5,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { state, sheet, propsStore, cacheStore, reset, realLog } = require('./stubs');
+const { state, sheet, logSheet, propsStore, cacheStore, reset, realLog } = require('./stubs');
 
 // Косвенный eval: объявления должны попасть в глобальную область, как в Apps Script.
 const globalEval = eval;
@@ -41,7 +41,6 @@ const row = () => sheet.rows[0];
 const results = [];
 function check(name, fn) {
   reset();
-  global._sheet = null;
   try { fn(); results.push(['PASS', name, '']); }
   catch (err) { results.push(['FAIL', name, err.message]); }
 }
@@ -289,7 +288,7 @@ check('любая комбинация ответов даёт заполнен�
   for (let a = 0; a < 4; a++) {
     for (let b = 0; b < 4; b++) {
       for (let c = 0; c < 4; c++) {
-        reset(); global._sheet = null;
+        reset();
         post(startMsg());
         [a, b, c, a, b].forEach((choice, i) => post(click(i, choice)));
         const r = sheet.rows[0];
@@ -320,6 +319,322 @@ check('финиш дописывает ответы, не попавшие в л
   const r = sheet.rows[0];
   eq(r.slice(5, 10).filter(String).length, 5, 'все пять ответов на месте');
   eq(r[12], 'завершил', 'статус');
+});
+
+/* ===== 13. ДИАГНОСТИКА ===== */
+
+const logRows = () => logSheet.rows.map((r) => ({ outcome: r[1], chat: r[3], event: r[4], details: r[7] }));
+
+check('журнал пишет строку на каждое обновление', () => {
+  post(startMsg());
+  post(click(0, 1));
+  const rows = logRows();
+  eq(rows.length, 2, 'записей в журнале');
+  eq(rows[0].outcome, 'обработан', 'итог по /start');
+  eq(rows[1].outcome, 'обработан', 'итог по нажатию');
+  eq(String(rows[0].chat), String(CHAT), 'chat_id в журнале');
+  if (!/сообщение: \/start/.test(rows[0].event)) throw new Error('событие: ' + rows[0].event);
+  if (!/кнопка: 0:1/.test(rows[1].event)) throw new Error('событие: ' + rows[1].event);
+  if (!/план: start/.test(rows[0].details)) throw new Error('план: ' + rows[0].details);
+  if (!/план: answer/.test(rows[1].details)) throw new Error('план: ' + rows[1].details);
+});
+
+check('отказ по секрету попадает в журнал с причиной', () => {
+  post(startMsg(), 'wrong');
+  const rows = logRows();
+  eq(rows.length, 1, 'записей в журнале');
+  eq(rows[0].outcome, 'ОТБРОШЕН: СЕКРЕТ', 'итог');
+  if (!/не совпадает/.test(rows[0].details)) throw new Error('причина: ' + rows[0].details);
+});
+
+check('вебхук без секрета виден в журнале как причина молчания', () => {
+  doPost({ parameter: {}, postData: { contents: JSON.stringify(startMsg()) } });
+  const rows = logRows();
+  eq(rows[0].outcome, 'ОТБРОШЕН: СЕКРЕТ', 'итог');
+  if (!/нет параметра s/.test(rows[0].details)) throw new Error('причина: ' + rows[0].details);
+  if (!/resetBot/.test(rows[0].details)) throw new Error('в причине нет подсказки');
+});
+
+check('ENFORCE_SECRET = off снимает проверку', () => {
+  propsStore.set('ENFORCE_SECRET', 'off');
+  doPost({ parameter: {}, postData: { contents: JSON.stringify(startMsg()) } });
+  eq(questions(), ['1'], 'вопрос отправлен');
+  eq(logRows()[0].outcome, 'обработан', 'итог');
+  propsStore.delete('ENFORCE_SECRET');
+});
+
+check('отсутствие TOKEN видно в журнале', () => {
+  propsStore.delete('TOKEN');
+  global.TOKEN = null;
+  post(startMsg());
+  const rows = logRows();
+  eq(rows[0].outcome, 'ОШИБКА: НЕТ TOKEN', 'итог');
+  if (!/Свойства скрипта/.test(rows[0].details)) throw new Error('нет подсказки: ' + rows[0].details);
+  global.TOKEN = 'TEST:TOKEN';
+  propsStore.set('TOKEN', 'TEST:TOKEN');
+});
+
+check('отказ Bot API попадает в журнал с описанием', () => {
+  post(startMsg());
+  state.failSendMessage = true;
+  post(click(0, 1));
+  state.failSendMessage = false;
+  const last = logRows().slice(-1)[0];
+  eq(last.outcome, 'ОШИБКА BOT API', 'итог');
+  if (!/bot was blocked/.test(last.details)) throw new Error('описание: ' + last.details);
+});
+
+check('исключение в обработчике попадает в журнал со следом', () => {
+  const original = global.runPlan_;
+  global.runPlan_ = () => { throw new Error('тестовый сбой'); };
+  post(startMsg());
+  global.runPlan_ = original;
+  const rows = logRows();
+  eq(rows[0].outcome, 'ИСКЛЮЧЕНИЕ', 'итог');
+  if (!/тестовый сбой/.test(rows[0].details)) throw new Error('след: ' + rows[0].details);
+});
+
+check('битый JSON не остаётся без записи', () => {
+  doPost({ parameter: { s: 'sekret' }, postData: { contents: '{не json' } });
+  eq(logRows()[0].outcome, 'БИТЫЙ JSON', 'итог');
+});
+
+check('пустой запрос не остаётся без записи', () => {
+  doPost({ parameter: { s: 'sekret' }, postData: { contents: '' } });
+  eq(logRows()[0].outcome, 'ПУСТОЙ ЗАПРОС', 'итог');
+});
+
+check('уровень журнала off и errors', () => {
+  setLogLevel('off');
+  post(startMsg());
+  eq(logRows().length, 0, 'при off записей нет');
+
+  setLogLevel('errors');
+  post(click(0, 1));                       // успешное действие
+  eq(logRows().length, 0, 'успех при errors не пишется');
+  post(startMsg(), 'wrong');               // сбой
+  eq(logRows().length, 1, 'сбой при errors пишется');
+  setLogLevel('all');
+});
+
+check('/diag отвечает версией и chat_id', () => {
+  post({ update_id: ++uid, message: { chat: { id: CHAT }, from: { id: CHAT }, text: '/diag' } });
+  const reply = state.sent.filter((s) => /Диагностика/.test(s.text || ''))[0];
+  if (!reply) throw new Error('ответа на /diag нет');
+  if (reply.text.indexOf(CODE_VERSION) === -1) throw new Error('нет версии: ' + reply.text);
+  if (reply.text.indexOf(String(CHAT)) === -1) throw new Error('нет chat_id');
+  eq(sheet.rows.length, 0, '/diag не создаёт строк в ответах');
+});
+
+check('doGet отдаёт отчёт с версией, без секрета — без лишнего', () => {
+  const open = JSON.parse(doGet({ parameter: {} }).getContent());
+  eq(open['версия_кода'], CODE_VERSION, 'версия в отчёте');
+  eq(open['токен_задан'], true, 'токен');
+  if (open['вебхук']) throw new Error('без ключа вебхук показывать нельзя');
+  if (!open['подсказка']) throw new Error('нет подсказки про ключ');
+
+  const full = JSON.parse(doGet({ parameter: { k: 'sekret' } }).getContent());
+  if (!full['вебхук']) throw new Error('с ключом вебхук должен быть');
+  if (!full['последние_события']) throw new Error('с ключом нужны последние события');
+});
+
+check('checkHealth видит устаревшее развёртывание', () => {
+  state.liveBody = JSON.stringify({ 'версия_кода': '4.0' });
+  const text = checkHealth();
+  if (!/РАЗВЁРНУТА СТАРАЯ ВЕРСИЯ/.test(text)) throw new Error('не распознано:\n' + text);
+  if (!/Версия: Новая/.test(text)) throw new Error('нет инструкции что делать');
+});
+
+check('checkHealth видит развёрнутый старый код без диагностики', () => {
+  state.liveBody = 'ok';
+  const text = checkHealth();
+  if (!/РАЗВЁРНУТА СТАРАЯ ВЕРСИЯ/.test(text)) throw new Error('не распознано:\n' + text);
+});
+
+check('checkHealth видит вебхук без секрета', () => {
+  state.webhookInfo = { url: 'https://script.google.com/macros/s/AKfycbxI3rdvrCC9mFwi4PbFESqW9iGQY91fogZdr4afhuWsGsYX42cnLMMGJaHaXdaNqTV3/exec', pending_update_count: 0 };
+  const text = checkHealth();
+  if (!/ОТБРАСЫВАЮТСЯ ПО СЕКРЕТУ/.test(text)) throw new Error('не распознано:\n' + text);
+});
+
+check('checkHealth видит очередь недоставленных и ошибку доставки', () => {
+  state.webhookInfo = {
+    url: 'https://script.google.com/macros/s/AKfycbxI3rdvrCC9mFwi4PbFESqW9iGQY91fogZdr4afhuWsGsYX42cnLMMGJaHaXdaNqTV3/exec?s=sekret',
+    pending_update_count: 17,
+    last_error_message: 'Wrong response from the webhook: 302 Found',
+    last_error_date: 1789450000
+  };
+  const text = checkHealth();
+  if (!/17 недоставленных/.test(text)) throw new Error('очередь не видна:\n' + text);
+  if (!/302 Found/.test(text)) throw new Error('ошибка доставки не видна');
+});
+
+check('checkHealth говорит прямо, что журнал пуст', () => {
+  const text = checkHealth();
+  if (!/Журнал пуст/.test(text)) throw new Error('не сказано про пустой журнал:\n' + text);
+  if (!/не вызывает скрипт/.test(text)) throw new Error('нет вывода о причине');
+});
+
+check('checkHealth на здоровом боте не находит проблем', () => {
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  post(startMsg());
+  const text = checkHealth();
+  if (!/Проблем не найдено/.test(text)) throw new Error('ложная тревога:\n' + text);
+});
+
+check('checkHealth не падает при недоступной таблице', () => {
+  const original = global.getSheet;
+  global.getSheet = () => { throw new Error('таблица недоступна'); };
+  const text = checkHealth();
+  global.getSheet = original;
+  if (!/таблица недоступна/.test(text)) throw new Error('ошибка не показана:\n' + text);
+});
+
+check('tailLog и ping не падают на пустом журнале', () => {
+  eq(tailLog(5), [], 'пустой журнал');
+  eq(ping(), false, 'без ADMIN_CHAT_ID отправлять некому');
+  post(startMsg());
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  eq(ping(), true, 'проверочное сообщение отправлено');
+  if (tailLog(5).length === 0) throw new Error('журнал должен быть непустым');
+});
+
+check('журнал не роняет обработчик, если лист недоступен', () => {
+  const original = global.logSheet_;
+  global.logSheet_ = () => { throw new Error('лист журнала недоступен'); };
+  post(startMsg());
+  global.logSheet_ = original;
+  eq(questions(), ['1'], 'вопрос всё равно отправлен');
+});
+
+check('resetBot прямо сообщает, что вебхук не установлен', () => {
+  const originalTg = global.tg;
+  global.tg = (method, payload) => {
+    if (method === 'setWebhook') return JSON.stringify({ ok: false, description: 'Failed to resolve host' });
+    return originalTg(method, payload);
+  };
+  resetBot();
+  global.tg = originalTg;
+  const log = state.logs.join('\n');
+  if (!/ВЕБХУК НЕ УСТАНОВЛЕН/.test(log)) throw new Error('нет громкого сообщения:\n' + log);
+  if (!/бот молчит на всё/.test(log)) throw new Error('нет вывода о последствиях');
+  if (!/WEBAPP_URL/.test(log)) throw new Error('нет подсказки про адрес');
+});
+
+check('resetBot создаёт секрет и сообщает о совпадении версий', () => {
+  propsStore.delete('WEBHOOK_SECRET');
+  resetBot();
+  if (!propsStore.get('WEBHOOK_SECRET')) throw new Error('секрет не создан');
+  const log = state.logs.join('\n');
+  if (!/вебхук установлен/.test(log)) throw new Error('нет подтверждения установки:\n' + log);
+  if (!/Развёрнутая версия совпадает/.test(log)) throw new Error('нет сверки версий');
+  propsStore.set('WEBHOOK_SECRET', 'sekret');
+});
+
+check('проверка() — тот же отчёт, что checkHealth()', () => {
+  post(startMsg());
+  eq(проверка(), checkHealth(), 'отчёты совпадают');
+});
+
+/* ===== 14. УВЕДОМЛЕНИЯ ОБ ОШИБКАХ ===== */
+
+const alerts = () => state.sent.filter((s) => /⚠️/.test(s.text || ''));
+
+check('сбой присылает уведомление в Telegram', () => {
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  const original = global.runPlan_;
+  global.runPlan_ = () => { throw new Error('тестовый сбой'); };
+  post(startMsg());
+  global.runPlan_ = original;
+
+  eq(alerts().length, 1, 'уведомлений отправлено');
+  const text = alerts()[0].text;
+  if (!/ИСКЛЮЧЕНИЕ/.test(text)) throw new Error('нет вида ошибки: ' + text);
+  if (!/тестовый сбой/.test(text)) throw new Error('нет текста ошибки');
+  if (!/Журнал/.test(text)) throw new Error('нет указания, где смотреть подробности');
+});
+
+check('однотипные сбои не превращаются в поток сообщений', () => {
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  const original = global.runPlan_;
+  global.runPlan_ = () => { throw new Error('один и тот же сбой'); };
+  // Десять одинаковых обращений: и ситуация, и ошибка совпадают.
+  for (let i = 0; i < 10; i++) {
+    post({ update_id: ++uid, message: { chat: { id: CHAT }, from: { id: CHAT }, text: 'привет' } });
+  }
+  global.runPlan_ = original;
+  eq(alerts().length, 1, 'уведомлений за десять одинаковых сбоев');
+  eq(logSheet.rows.length, 10, 'в журнале при этом все десять');
+});
+
+check('разные виды сбоев уведомляют по отдельности', () => {
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  const original = global.runPlan_;
+  global.runPlan_ = () => { throw new Error('сбой в обработке сообщения'); };
+  post({ update_id: ++uid, message: { chat: { id: CHAT }, from: { id: CHAT }, text: 'привет' } });
+  global.runPlan_ = () => { throw new Error('совсем другой сбой'); };
+  post({ update_id: ++uid, message: { chat: { id: CHAT }, from: { id: CHAT }, text: 'привет' } });
+  global.runPlan_ = original;
+  eq(alerts().length, 2, 'уведомлений по двум разным ошибкам');
+});
+
+check('ALERTS = off выключает уведомления, журнал продолжает писать', () => {
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  propsStore.set('ALERTS', 'off');
+  const original = global.runPlan_;
+  global.runPlan_ = () => { throw new Error('сбой при выключенных уведомлениях'); };
+  post(startMsg());
+  global.runPlan_ = original;
+  propsStore.delete('ALERTS');
+  eq(alerts().length, 0, 'уведомлений отправлено');
+  eq(logSheet.rows[0][1], 'ИСКЛЮЧЕНИЕ', 'в журнале запись есть');
+});
+
+check('успешная работа уведомлений не вызывает', () => {
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  post(startMsg());
+  post(click(0, 1));
+  eq(alerts().length, 0, 'уведомлений отправлено');
+});
+
+check('сбой журнала не срывает обработку и не уходит наружу', () => {
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  const originalLog = global.logSheet_;
+  const originalAlert = global.alertAdmin_;
+  global.logSheet_ = () => { throw new Error('лист недоступен'); };
+  global.alertAdmin_ = () => { throw new Error('и уведомление тоже не ушло'); };
+  const out = post(startMsg());          // не должно бросить исключение
+  global.logSheet_ = originalLog;
+  global.alertAdmin_ = originalAlert;
+  eq(out.getContent(), 'ok', 'ответ вебхука');
+  eq(questions(), ['1'], 'вопрос всё равно отправлен');
+});
+
+check('включитьУведомления настраивает адресата', () => {
+  post(startMsg());                       // в журнале появился chat_id
+  включитьУведомления();
+  eq(propsStore.get('ADMIN_CHAT_ID'), String(CHAT), 'адресат из журнала');
+  if (!state.sent.some((s) => /Проверка связи/.test(s.text || ''))) {
+    throw new Error('проверочное сообщение не отправлено');
+  }
+});
+
+check('/diag показывает состояние уведомлений', () => {
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  post({ update_id: ++uid, message: { chat: { id: CHAT }, from: { id: CHAT }, text: '/diag' } });
+  const reply = state.sent.filter((s) => /Диагностика/.test(s.text || ''))[0];
+  if (!/уведомления об ошибках: приходят в чат/.test(reply.text)) {
+    throw new Error('состояние уведомлений не показано: ' + reply.text);
+  }
+});
+
+check('checkHealth напоминает настроить уведомления', () => {
+  post(startMsg());
+  const text = checkHealth();
+  if (!/Уведомления об ошибках выключены/.test(text)) throw new Error('нет напоминания:\n' + text);
+  propsStore.set('ADMIN_CHAT_ID', String(CHAT));
+  const text2 = checkHealth();
+  if (/Уведомления об ошибках выключены/.test(text2)) throw new Error('напоминание осталось после настройки');
 });
 
 const failed = results.filter((r) => r[0] === 'FAIL');

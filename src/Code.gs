@@ -43,6 +43,17 @@ var STATE_TTL = 21600;   // 6 часов — предел CacheService
 var LOCK_MS = 5000;      // блокировка только на переход состояния
 var COL_FIRST_ANSWER = 6;
 
+// Версия видна в отчёте по адресу развёртывания и в ответе на /diag.
+// По ней сразу понятно, обновлено ли развёртывание.
+var CODE_VERSION = '4.1';
+
+var LOG_SHEET_NAME = 'Журнал';
+var LOG_HEADERS = ['Время', 'Итог', 'update_id', 'chat_id', 'Событие', 'Шаг', 'Мс', 'Подробности', 'Версия'];
+var LOG_KEEP_ROWS = 2000;   // сверх этого самые старые строки удаляются
+
+// Последняя ошибка Bot API за текущее выполнение — попадает в журнал.
+var _lastApiError = '';
+
 // ============ ТЕКСТЫ ВОПРОСОВ ============
 
 var WELCOME =
@@ -106,36 +117,117 @@ var QUESTIONS = [
  */
 function doPost(e) {
   var ok = ContentService.createTextOutput('ok');
-  var update;
-  try {
-    update = JSON.parse(e.postData.contents);
-  } catch (err) {
-    return ok;
-  }
-
-  if (!secretOk_(e)) {
-    console.warn('запрос с неверным секретом отброшен');
-    return ok;
-  }
+  var t0 = Date.now();
+  var ctx = { updateId: '', chatId: '', event: '', step: '', plan: '' };
+  _lastApiError = '';
 
   try {
+    var raw = (e && e.postData) ? e.postData.contents : '';
+    if (!raw) {
+      logUpdate_(ctx, 'ПУСТОЙ ЗАПРОС', t0, 'в теле запроса нет данных — так выглядит открытие адреса в браузере, а не вызов Telegram');
+      return ok;
+    }
+
+    var update;
+    try {
+      update = JSON.parse(raw);
+    } catch (err) {
+      logUpdate_(ctx, 'БИТЫЙ JSON', t0, String(raw).slice(0, 200));
+      return ok;
+    }
+
+    ctx.updateId = update.update_id === undefined ? '' : update.update_id;
+    describeUpdate_(ctx, update);
+
+    var secret = checkSecret_(e);
+    if (!secret.ok) {
+      logUpdate_(ctx, 'ОТБРОШЕН: СЕКРЕТ', t0, secret.reason);
+      return ok;
+    }
+
+    if (!TOKEN) {
+      logUpdate_(ctx, 'ОШИБКА: НЕТ TOKEN', t0,
+        'свойство скрипта TOKEN пусто. Настройки проекта → Свойства скрипта → ключ TOKEN');
+      return ok;
+    }
+
     var plan = planUpdate_(update);
-    if (plan) runPlan_(plan);
+    if (!plan) {
+      logUpdate_(ctx, 'пропущен', t0,
+        'повторная доставка того же update_id либо неподдерживаемый тип обновления');
+      return ok;
+    }
+
+    ctx.plan = plan.kind;
+    if (plan.step !== undefined) ctx.step = plan.step;
+    runPlan_(plan);
+
+    logUpdate_(ctx, _lastApiError ? 'ОШИБКА BOT API' : 'обработан', t0, _lastApiError);
   } catch (err) {
-    console.error(err);
+    logUpdate_(ctx, 'ИСКЛЮЧЕНИЕ', t0, errText_(err));
   }
   return ok;
 }
 
-function doGet() {
-  return ContentService.createTextOutput('ok');
+/**
+ * Открытие адреса развёртывания в браузере отдаёт отчёт о состоянии.
+ * Это самая быстрая проверка «какая версия кода реально развёрнута»:
+ * если в ответе версия старая или вместо отчёта что-то другое —
+ * развёртывание не обновлено.
+ *
+ * Без ключа отчёт не содержит ничего личного: адрес открыт всем.
+ * Полный отчёт: ?k=<WEBHOOK_SECRET>
+ */
+function doGet(e) {
+  var report = { версия_кода: CODE_VERSION, время: nowText_() };
+  try {
+    var sp = PropertiesService.getScriptProperties();
+    var secret = sp.getProperty('WEBHOOK_SECRET');
+    report.токен_задан = !!TOKEN;
+    report.секрет_задан = !!secret;
+    report.уровень_журнала = logLevel_();
+
+    try {
+      report.строк_ответов = Math.max(getSheet().getLastRow() - 1, 0);
+      report.строк_журнала = Math.max(logSheet_().getLastRow() - 1, 0);
+    } catch (err) {
+      report.таблица = 'ОШИБКА: ' + errText_(err);
+    }
+
+    if (secret && e && e.parameter && e.parameter.k === secret) {
+      report.вебхук = webhookRaw_();
+      report.последние_события = tailRows_(10);
+    } else {
+      report.подсказка = 'полный отчёт: добавьте к адресу ?k=<WEBHOOK_SECRET>';
+    }
+  } catch (err) {
+    report.ошибка = errText_(err);
+  }
+  return ContentService.createTextOutput(JSON.stringify(report, null, 2))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
-/** Секрет передаётся в query-строке вебхука: заголовки в Apps Script не видны. */
-function secretOk_(e) {
-  var expected = PropertiesService.getScriptProperties().getProperty('WEBHOOK_SECRET');
-  if (!expected) return true;   // секрет ещё не настроен — не блокируем бота
-  return !!(e && e.parameter && e.parameter.s === expected);
+/**
+ * Секрет передаётся в query-строке вебхука: заголовки в Apps Script не видны.
+ * Возвращает причину отказа, а не просто false: молчаливый отказ по секрету —
+ * это бот, который «не реагирует на /start» без единого следа.
+ */
+function checkSecret_(e) {
+  var sp = PropertiesService.getScriptProperties();
+  var expected = sp.getProperty('WEBHOOK_SECRET');
+  if (!expected) return { ok: true, reason: '' };
+  if (sp.getProperty('ENFORCE_SECRET') === 'off') return { ok: true, reason: '' };
+
+  var got = (e && e.parameter) ? e.parameter.s : undefined;
+  if (got === expected) return { ok: true, reason: '' };
+
+  return {
+    ok: false,
+    reason: got === undefined
+      ? 'в запросе нет параметра s — вебхук поставлен без секрета. Выполните resetBot(), ' +
+        'либо отключите проверку: свойство ENFORCE_SECRET = off'
+      : 'параметр s не совпадает с WEBHOOK_SECRET — вебхук поставлен со старым секретом, выполните resetBot()'
+  };
 }
 
 // ============ ЭТАП 1: ПЛАН (под блокировкой) ============
@@ -163,6 +255,10 @@ function planUpdate_(update) {
 function planMessage_(msg) {
   var chatId = msg.chat.id;
   var text = (msg.text || '').trim();
+
+  if (text.indexOf('/diag') === 0) {
+    return { kind: 'diag', chatId: chatId };
+  }
 
   if (text.indexOf('/start') !== 0) {
     return { kind: 'text', chatId: chatId, text: 'Чтобы пройти тест, нажмите /start' };
@@ -233,6 +329,10 @@ function runPlan_(plan) {
 
     case 'ask':
       askQuestion(plan.chatId, plan.step, plan.prefix);
+      return;
+
+    case 'diag':
+      send(plan.chatId, diagText_(plan.chatId));
       return;
 
     case 'lost':
@@ -478,16 +578,42 @@ function resetBot() {
   var secret = sp.getProperty('WEBHOOK_SECRET');
   var base = sp.getProperty('WEBAPP_URL') || WEBAPP_URL;
 
-  console.log('1) ' + tg('deleteWebhook', { drop_pending_updates: true }));
+  console.log('1) удаление старого вебхука: ' + tg('deleteWebhook', { drop_pending_updates: true }));
   Utilities.sleep(2000);
-  console.log('2) ' + tg('setWebhook', {
+
+  var setBody = tg('setWebhook', {
     url: base + '?s=' + encodeURIComponent(secret),
     allowed_updates: JSON.stringify(['message', 'callback_query']),
     drop_pending_updates: true
-  }));
-  console.log('3) ' + tg('getWebhookInfo', {}));
+  });
+  var setRes = jsonOf_(setBody);
+  if (setRes && setRes.ok) {
+    console.log('2) вебхук установлен на ' + base);
+  } else {
+    console.log('2) ВЕБХУК НЕ УСТАНОВЛЕН: ' + descriptionOf_(setRes));
+    console.log('   Частые причины:');
+    console.log('   — развёртывание не типа «Веб-приложение» или доступ не «Все»;');
+    console.log('   — адрес WEBAPP_URL не существует: возьмите актуальный в «Управление развёртываниями»');
+    console.log('     и положите его в свойство WEBAPP_URL;');
+    console.log('   — недействительный TOKEN.');
+    console.log('   Пока вебхук не установлен, бот молчит на всё, включая /start.');
+  }
+
+  console.log('3) состояние вебхука: ' + tg('getWebhookInfo', {}));
   console.log('Триггеров в проекте: ' + ScriptApp.getProjectTriggers().length +
               ' (должно быть 0: триггер с getUpdates рядом с вебхуком даёт дубли)');
+
+  console.log('Версия кода в редакторе: ' + CODE_VERSION);
+  var live = liveVersion_(base);
+  if (live.version === CODE_VERSION) {
+    console.log('Развёрнутая версия совпадает — код обновлён.');
+  } else {
+    console.log('ВНИМАНИЕ: по адресу вебхука отвечает версия «' + (live.version || 'неизвестна') +
+                '», а в редакторе ' + CODE_VERSION + '.');
+    console.log('Сделайте: Развернуть → Управление развёртываниями → карандаш → Версия: Новая → Развернуть,');
+    console.log('затем выполните resetBot() снова. Иначе Telegram продолжит вызывать старый код.');
+  }
+  console.log('Подробная проверка: функция checkHealth');
 }
 
 /** Диагностика. pending_update_count > 0 и last_error_message — очередь повторов. */
@@ -626,6 +752,432 @@ function selfTest() {
   return problems;
 }
 
+// ============ ДИАГНОСТИКА ============
+
+/**
+ * ГЛАВНАЯ ПРОВЕРКА. Запускать в редакторе, когда бот не отвечает.
+ * Отвечает на вопрос «где именно сломалось» по порядку, от токена до листа.
+ */
+function checkHealth() {
+  var sp = PropertiesService.getScriptProperties();
+  var lines = [];
+  var problems = [];
+  var out = function (t) { lines.push(t); };
+
+  out('=== ПРОВЕРКА БОТА, версия кода в редакторе: ' + CODE_VERSION + ' ===');
+  out('');
+
+  // 1. Токен
+  if (!TOKEN) {
+    out('1. ТОКЕН: не задан');
+    problems.push('Задайте свойство TOKEN: Настройки проекта → Свойства скрипта');
+  } else {
+    var me = jsonOf_(tg('getMe', {}));
+    if (me && me.ok) {
+      out('1. ТОКЕН: в порядке, бот @' + me.result.username);
+    } else {
+      out('1. ТОКЕН: отклонён Telegram — ' + descriptionOf_(me));
+      problems.push('Токен недействителен. Возьмите новый у @BotFather и впишите в свойство TOKEN');
+    }
+  }
+
+  // 2. Какая версия реально развёрнута
+  var base = sp.getProperty('WEBAPP_URL') || WEBAPP_URL;
+  out('');
+  out('2. РАЗВЁРНУТАЯ ВЕРСИЯ');
+  out('   адрес: ' + base);
+  var live = liveVersion_(base);
+  if (live.error) {
+    out('   ОШИБКА обращения к адресу: ' + live.error);
+    problems.push('Адрес развёртывания недоступен. Проверьте WEBAPP_URL и что развёртывание — тип «Веб-приложение», доступ «Все»');
+  } else if (!live.version) {
+    out('   по адресу отвечает код, который не умеет отдавать отчёт');
+    out('   ответ: ' + String(live.body).slice(0, 120));
+    problems.push('РАЗВЁРНУТА СТАРАЯ ВЕРСИЯ. Развернуть → Управление развёртываниями → карандаш → Версия: Новая');
+  } else if (live.version !== CODE_VERSION) {
+    out('   развёрнута ' + live.version + ', в редакторе ' + CODE_VERSION);
+    problems.push('РАЗВЁРНУТА СТАРАЯ ВЕРСИЯ. Развернуть → Управление развёртываниями → карандаш → Версия: Новая');
+  } else {
+    out('   развёрнута ' + live.version + ' — совпадает с редактором');
+  }
+
+  // 3. Вебхук
+  out('');
+  out('3. ВЕБХУК');
+  var info = jsonOf_(tg('getWebhookInfo', {}));
+  if (!info || !info.ok) {
+    out('   не удалось получить: ' + descriptionOf_(info));
+    problems.push('Выполните resetBot()');
+  } else {
+    var w = info.result;
+    out('   url: ' + (w.url || '(пусто)'));
+    out('   в очереди недоставленных: ' + (w.pending_update_count || 0));
+    if (w.last_error_message) {
+      out('   ПОСЛЕДНЯЯ ОШИБКА ДОСТАВКИ: ' + w.last_error_message +
+          ' (' + tsText_(w.last_error_date) + ')');
+      problems.push('Telegram не может доставить обновления: ' + w.last_error_message);
+    } else {
+      out('   ошибок доставки нет');
+    }
+
+    if (!w.url) {
+      problems.push('Вебхук не установлен. Выполните resetBot()');
+    } else {
+      if (w.url.indexOf(base) !== 0) {
+        out('   ВНИМАНИЕ: вебхук указывает не на текущий адрес развёртывания');
+        problems.push('Вебхук указывает на другое развёртывание — это значит старый код. Выполните resetBot()');
+      }
+      var secret = sp.getProperty('WEBHOOK_SECRET');
+      var enforced = sp.getProperty('ENFORCE_SECRET') !== 'off';
+      if (secret && enforced) {
+        if (w.url.indexOf('s=' + secret) === -1) {
+          out('   ВНИМАНИЕ: в адресе вебхука нет текущего секрета');
+          problems.push('ВСЕ ОБНОВЛЕНИЯ ОТБРАСЫВАЮТСЯ ПО СЕКРЕТУ. Выполните resetBot(), ' +
+                        'либо задайте свойство ENFORCE_SECRET = off');
+        } else {
+          out('   секрет в адресе совпадает');
+        }
+      } else {
+        out('   проверка секрета выключена' + (secret ? ' (ENFORCE_SECRET = off)' : ' (секрет не задан)'));
+      }
+    }
+    if ((w.pending_update_count || 0) > 0) {
+      problems.push('В очереди ' + w.pending_update_count + ' недоставленных обновлений — ' +
+                    'обработчик их не подтверждает. Выполните resetBot() (очередь сбрасывается)');
+    }
+  }
+
+  // 4. Триггеры
+  out('');
+  var triggers = ScriptApp.getProjectTriggers();
+  out('4. ТРИГГЕРЫ: ' + triggers.length);
+  if (triggers.length) {
+    triggers.forEach(function (t) { out('   ' + t.getHandlerFunction() + ' / ' + t.getEventType()); });
+    problems.push('Триггеры при работе по вебхуку не нужны: триггер с getUpdates обрабатывает обновления вторично');
+  }
+
+  // 5. Таблица
+  out('');
+  out('5. ТАБЛИЦА');
+  try {
+    var sheet = getSheet();
+    out('   лист «' + SHEET_NAME + '»: строк с ответами ' + Math.max(sheet.getLastRow() - 1, 0));
+    var head = sheet.getRange(1, 1, 1, 15).getValues()[0];
+    if (String(head[1]).trim() !== 'chat_id') {
+      problems.push('Шапка листа «' + SHEET_NAME + '» не на месте: во втором столбце ожидается chat_id');
+    }
+    out('   лист «' + LOG_SHEET_NAME + '»: записей ' + Math.max(logSheet_().getLastRow() - 1, 0));
+  } catch (err) {
+    out('   ОШИБКА: ' + errText_(err));
+    problems.push('Не удалось открыть таблицу: ' + errText_(err));
+  }
+  out('   уровень журнала: ' + logLevel_() + ' (setLogLevel: all | errors | off)');
+  out('   уведомления об ошибках в Telegram: ' + alertsState_());
+  if (!sp.getProperty('ADMIN_CHAT_ID')) {
+    problems.push('Уведомления об ошибках выключены. Задайте свойство ADMIN_CHAT_ID — ' +
+                  'свой chat_id покажет команда /diag в боте, и сбои будут приходить вам в Telegram');
+  }
+
+  // 6. Последние события
+  out('');
+  out('6. ПОСЛЕДНИЕ СОБЫТИЯ В ЖУРНАЛЕ');
+  var tail = tailRows_(8);
+  if (!tail.length) {
+    out('   журнал пуст: ни одно обновление до кода не дошло');
+    problems.push('Журнал пуст. Значит Telegram вообще не вызывает скрипт: причина в развёртывании или вебхуке, ' +
+                  'а не в логике бота');
+  } else {
+    tail.forEach(function (r) { out('   ' + r); });
+  }
+
+  // Итог
+  out('');
+  out('=== ИТОГ ===');
+  if (!problems.length) {
+    out('Проблем не найдено. Если бот всё равно молчит — нажмите /start и снова посмотрите журнал.');
+  } else {
+    problems.forEach(function (p, i) { out((i + 1) + ') ' + p); });
+  }
+
+  var text = lines.join('\n');
+  console.log(text);
+  return text;
+}
+
+function alertsState_() {
+  var sp = PropertiesService.getScriptProperties();
+  if (sp.getProperty('ALERTS') === 'off') return 'выключены (ALERTS = off)';
+  var admin = sp.getProperty('ADMIN_CHAT_ID');
+  return admin ? 'приходят в чат ' + admin : 'не настроены (нет ADMIN_CHAT_ID)';
+}
+
+/** Включает уведомления об ошибках в указанный чат. */
+function включитьУведомления(chatId) {
+  var sp = PropertiesService.getScriptProperties();
+  var target = chatId || sp.getProperty('ADMIN_CHAT_ID') || lastChatId_();
+  if (!target) {
+    console.log('Не знаю, куда отправлять. Напишите боту /diag — он покажет ваш chat_id, ' +
+                'затем вызовите включитьУведомления(<chat_id>)');
+    return false;
+  }
+  sp.setProperty('ADMIN_CHAT_ID', String(target));
+  sp.deleteProperty('ALERTS');
+  console.log('Уведомления об ошибках будут приходить в чат ' + target);
+  return ping();
+}
+
+/** Русский псевдоним checkHealth — чтобы функция находилась в списке редактора. */
+function проверка() {
+  return checkHealth();
+}
+
+/** Запрашивает у развёрнутого адреса его версию: так видно, обновлено ли развёртывание. */
+function liveVersion_(base) {
+  try {
+    var res = UrlFetchApp.fetch(base, { muteHttpExceptions: true, followRedirects: true });
+    var body = res.getContentText();
+    var parsed = null;
+    try { parsed = JSON.parse(body); } catch (err) { parsed = null; }
+    return { version: parsed ? parsed['версия_кода'] : '', body: body, error: '' };
+  } catch (err) {
+    return { version: '', body: '', error: errText_(err) };
+  }
+}
+
+/** Отправляет проверочное сообщение: проверяет путь «скрипт → Telegram». */
+function ping() {
+  var chatId = PropertiesService.getScriptProperties().getProperty('ADMIN_CHAT_ID') || lastChatId_();
+  if (!chatId) {
+    console.log('Некому отправлять: задайте свойство ADMIN_CHAT_ID (ваш chat_id покажет команда /diag в боте)');
+    return false;
+  }
+  var okSent = send(chatId, 'Проверка связи. Версия кода ' + CODE_VERSION + ', ' + nowText_());
+  console.log(okSent ? 'Отправлено в чат ' + chatId : 'НЕ отправлено: ' + _lastApiError);
+  return okSent;
+}
+
+/** Последние записи журнала в консоль. */
+function tailLog(n) {
+  var rows = tailRows_(n || 20);
+  console.log(rows.length ? rows.join('\n') : 'журнал пуст');
+  return rows;
+}
+
+/** all — писать всё, errors — только сбои, off — не писать. */
+function setLogLevel(level) {
+  var allowed = ['all', 'errors', 'off'];
+  if (allowed.indexOf(level) === -1) {
+    console.log('Допустимо: ' + allowed.join(', '));
+    return;
+  }
+  PropertiesService.getScriptProperties().setProperty('LOG_LEVEL', level);
+  console.log('Уровень журнала: ' + level);
+}
+
+/** Очищает журнал, оставляя шапку. */
+function очиститьЖурнал() {
+  var sheet = logSheet_();
+  var last = sheet.getLastRow();
+  if (last > 1) sheet.deleteRows(2, last - 1);
+  console.log('Журнал очищен, удалено записей: ' + Math.max(last - 1, 0));
+}
+
+// ============ ЖУРНАЛ ============
+
+function logLevel_() {
+  return PropertiesService.getScriptProperties().getProperty('LOG_LEVEL') || 'all';
+}
+
+function isFailure_(outcome) {
+  return /^(ОШИБКА|ИСКЛЮЧЕНИЕ|ОТБРОШЕН|БИТЫЙ|ПУСТОЙ)/.test(outcome);
+}
+
+/**
+ * Пишет одну строку в журнал и при сбое присылает уведомление в Telegram.
+ * Сам никогда не бросает исключений: он вызывается в том числе из catch
+ * в doPost, и исключение отсюда ушло бы наружу как ответ 500 — то есть
+ * запустило бы поток повторных доставок.
+ */
+function logUpdate_(ctx, outcome, t0, details) {
+  try {
+    var ms = Date.now() - t0;
+    details = [ctx.plan ? 'план: ' + ctx.plan : '', details || '']
+      .filter(function (x) { return x; }).join(' | ');
+
+    var line = outcome + ' | update ' + (ctx.updateId || '-') +
+               ' | chat ' + (ctx.chatId || '-') +
+               ' | ' + (ctx.event || '-') +
+               (ctx.step === '' || ctx.step === undefined ? '' : ' | шаг ' + ctx.step) +
+               ' | ' + ms + ' мс' + (details ? ' | ' + details : '');
+    var failed = isFailure_(outcome);
+    if (failed) console.error(line); else console.log(line);
+
+    var level = logLevel_();
+    if (level !== 'off' && !(level === 'errors' && !failed)) {
+      try {
+        var sheet = logSheet_();
+        sheet.appendRow([
+          nowText_(), outcome, ctx.updateId, String(ctx.chatId || ''),
+          ctx.event, ctx.step, ms, String(details || '').slice(0, 900), CODE_VERSION
+        ]);
+        var last = sheet.getLastRow();
+        if (last > LOG_KEEP_ROWS + 500) sheet.deleteRows(2, last - LOG_KEEP_ROWS);
+      } catch (err) {
+        console.error('журнал недоступен: ' + errText_(err));
+      }
+    }
+
+    if (failed) alertAdmin_(outcome, ctx, details);
+  } catch (err) {
+    console.error('сбой журналирования: ' + errText_(err));
+  }
+}
+
+/**
+ * Присылает сбой в Telegram администратору.
+ * Не чаще одного сообщения в 10 минут на один вид ошибки, иначе поток
+ * однотипных сбоев превратится в поток сообщений.
+ *
+ * Включается заданием свойства ADMIN_CHAT_ID (свой chat_id покажет /diag).
+ * Выключается свойством ALERTS = off.
+ */
+function alertAdmin_(outcome, ctx, details) {
+  try {
+    var sp = PropertiesService.getScriptProperties();
+    var admin = sp.getProperty('ADMIN_CHAT_ID');
+    if (!admin || sp.getProperty('ALERTS') === 'off') return;
+
+    var cache = CacheService.getScriptCache();
+    var signature = 'al_' + String(outcome + '|' + details)
+      .replace(/[^a-zA-Zа-яА-Я0-9]+/g, '').slice(0, 60);
+    if (cache.get(signature)) return;
+    cache.put(signature, '1', 600);
+
+    var text = '⚠️ <b>' + outcome + '</b>\n' +
+      'версия ' + CODE_VERSION + ', ' + nowText_() + '\n' +
+      'chat: ' + (ctx.chatId || '-') + ', update: ' + (ctx.updateId || '-') + '\n' +
+      'что пришло: ' + (ctx.event || '-') + '\n\n' +
+      String(details || '').slice(0, 700) + '\n\n' +
+      'Подробности — лист «' + LOG_SHEET_NAME + '», функция проверка()';
+
+    // Напрямую, без send(): у send() свой разбор ответа и своя запись ошибок,
+    // а здесь важно не уйти в круг «ошибка → уведомление → ошибка».
+    tg('sendMessage', { chat_id: String(admin), text: text, parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('не удалось отправить уведомление: ' + errText_(err));
+  }
+}
+
+/** Что именно пришло — видно в журнале без раскопок в исходном JSON. */
+function describeUpdate_(ctx, update) {
+  if (update.message) {
+    ctx.chatId = update.message.chat ? update.message.chat.id : '';
+    ctx.event = 'сообщение: ' + String(update.message.text || '(без текста)').slice(0, 40);
+  } else if (update.callback_query) {
+    var cq = update.callback_query;
+    ctx.chatId = (cq.message && cq.message.chat) ? cq.message.chat.id : (cq.from || {}).id;
+    ctx.event = 'кнопка: ' + String(cq.data || '');
+  } else {
+    ctx.event = 'тип не поддерживается: ' + Object.keys(update).join(',');
+  }
+}
+
+var _logSheet = null;
+function logSheet_() {
+  if (_logSheet) return _logSheet;
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(LOG_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(LOG_SHEET_NAME);
+    sheet.appendRow(LOG_HEADERS);
+    sheet.setFrozenRows(1);
+  }
+  _logSheet = sheet;
+  return sheet;
+}
+
+function tailRows_(n) {
+  try {
+    var sheet = logSheet_();
+    var last = sheet.getLastRow();
+    if (last < 2) return [];
+    var from = Math.max(2, last - n + 1);
+    return sheet.getRange(from, 1, last - from + 1, LOG_HEADERS.length).getValues()
+      .map(function (r) {
+        return [r[0], r[1], 'update ' + r[2], 'chat ' + r[3], r[4],
+                r[5] === '' ? '' : 'шаг ' + r[5], r[6] + ' мс', r[7]]
+          .filter(function (x) { return x !== '' && x !== null; }).join(' | ');
+      });
+  } catch (err) {
+    return ['журнал недоступен: ' + errText_(err)];
+  }
+}
+
+function lastChatId_() {
+  try {
+    var sheet = logSheet_();
+    var last = sheet.getLastRow();
+    for (var r = last; r >= 2; r--) {
+      var id = String(sheet.getRange(r, 4).getValue()).trim();
+      if (id) return id;
+    }
+  } catch (err) { /* журнал может быть недоступен */ }
+  return '';
+}
+
+/** Ответ бота на /diag: доказывает, что обновление доходит до кода. */
+function diagText_(chatId) {
+  var state = getState(chatId);
+  var row = 0;
+  try { row = rowOf_(chatId); } catch (err) { row = 0; }
+  return 'Диагностика\n' +
+    'версия кода: ' + CODE_VERSION + '\n' +
+    'ваш chat_id: ' + chatId + '\n' +
+    'шаг теста: ' + (state ? state.step : 'состояния нет') + '\n' +
+    'строка в таблице: ' + (row || 'нет') + '\n' +
+    'уровень журнала: ' + logLevel_() + '\n' +
+    'уведомления об ошибках: ' + alertsState_() + '\n' +
+    'время: ' + nowText_();
+}
+
+// ============ МЕЛКИЕ ХЕЛПЕРЫ ============
+
+function errText_(err) {
+  if (!err) return 'неизвестная ошибка';
+  var text = err.stack ? String(err.stack) : String(err);
+  return text.replace(/\s+/g, ' ').slice(0, 500);
+}
+
+function nowText_() {
+  return Utilities.formatDate(new Date(), 'Europe/Moscow', 'dd.MM.yyyy HH:mm:ss');
+}
+
+function tsText_(unixSeconds) {
+  if (!unixSeconds) return '';
+  return Utilities.formatDate(new Date(unixSeconds * 1000), 'Europe/Moscow', 'dd.MM.yyyy HH:mm:ss');
+}
+
+function jsonOf_(body) {
+  try { return JSON.parse(body); } catch (err) { return null; }
+}
+
+function descriptionOf_(parsed) {
+  if (!parsed) return 'ответ не разобран';
+  return parsed.description || JSON.stringify(parsed).slice(0, 200);
+}
+
+function webhookRaw_() {
+  var parsed = jsonOf_(tg('getWebhookInfo', {}));
+  if (!parsed || !parsed.ok) return { ошибка: descriptionOf_(parsed) };
+  var w = parsed.result;
+  return {
+    установлен: !!w.url,
+    в_очереди: w.pending_update_count || 0,
+    последняя_ошибка: w.last_error_message || '',
+    когда: tsText_(w.last_error_date)
+  };
+}
+
 // ============ СЛУЖЕБНОЕ ============
 
 var _sheet = null;
@@ -666,19 +1218,20 @@ function send(chatId, text, keyboard) {
   if (keyboard) payload.reply_markup = JSON.stringify(keyboard);
   try {
     var body = tg('sendMessage', payload);
-    if (body.indexOf('"ok":true') === -1) {
-      console.error('sendMessage отклонён: ' + body.slice(0, 300));
-      return false;
-    }
-    return true;
+    return noteApiResult_('sendMessage', body);
   } catch (err) {
-    console.error(err);
+    noteApiError_('sendMessage: ' + errText_(err));
     return false;
   }
 }
 
 /** Один запрос к Telegram. */
 function tg(method, payload) {
+  if (!TOKEN) {
+    var text = 'свойство TOKEN не задано, запрос ' + method + ' не отправлен';
+    noteApiError_(text);
+    return JSON.stringify({ ok: false, description: text });
+  }
   return UrlFetchApp.fetch(API + TOKEN + '/' + method, {
     method: 'post',
     payload: payload,
@@ -686,8 +1239,16 @@ function tg(method, payload) {
   }).getContentText();
 }
 
-/** Несколько запросов разом, параллельно. calls: [['метод', {данные}], ...] */
+/**
+ * Несколько запросов разом, параллельно. calls: [['метод', {данные}], ...]
+ * Ответы обязательно разбираются: отказ answerCallbackQuery или
+ * editMessageText раньше не был виден нигде.
+ */
 function tgAsync(calls) {
+  if (!TOKEN) {
+    noteApiError_('свойство TOKEN не задано, запросы не отправлены');
+    return;
+  }
   var requests = calls.map(function (c) {
     return {
       url: API + TOKEN + '/' + c[0],
@@ -697,10 +1258,26 @@ function tgAsync(calls) {
     };
   });
   try {
-    UrlFetchApp.fetchAll(requests);
+    var responses = UrlFetchApp.fetchAll(requests);
+    responses.forEach(function (res, i) {
+      noteApiResult_(calls[i][0], res.getContentText());
+    });
   } catch (err) {
-    console.error(err);
+    noteApiError_('fetchAll: ' + errText_(err));
   }
+}
+
+/** true, если Telegram принял запрос. Отказ запоминается для журнала. */
+function noteApiResult_(method, body) {
+  if (String(body).indexOf('\"ok\":true') !== -1) return true;
+  var parsed = jsonOf_(body);
+  noteApiError_(method + ' отклонён: ' + (parsed ? descriptionOf_(parsed) : String(body).slice(0, 200)));
+  return false;
+}
+
+function noteApiError_(text) {
+  _lastApiError = _lastApiError ? _lastApiError + '; ' + text : text;
+  console.error(text);
 }
 
 /*

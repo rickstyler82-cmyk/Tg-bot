@@ -18,7 +18,10 @@ const state = {
   fetchAll: 0,
   onSlowSheetWrite: null,
   failSendMessage: false,
-  lockHeld: false
+  lockHeld: false,
+  deploymentFetches: 0,
+  liveBody: JSON.stringify({ 'версия_кода': '4.1' }),
+  webhookInfo: null
 };
 
 class Sheet {
@@ -31,7 +34,15 @@ class Sheet {
       hook();
     }
   }
-  appendRow(values) { this.rows.push(values.slice()); this.slow(); }
+  appendRow(values) {
+    // Первый appendRow в новый лист — это шапка, как в реальном коде.
+    if (!this.headers && !this.rows.length && String(values[0]).indexOf('Время') === 0) {
+      this.headers = values.slice();
+      return;
+    }
+    this.rows.push(values.slice());
+    this.slow();
+  }
   getLastRow() { return this.rows.length ? this.rows.length + 1 : 1; }
   setFrozenRows(n) { this.frozen = n; }
   deleteRow(row) { this.rows.splice(row - 2, 1); }
@@ -64,7 +75,7 @@ class Sheet {
     };
   }
   cell(row, col) {
-    if (row === 1) return HEADERS[col - 1] || '';
+    if (row === 1) return (this.headers || HEADERS)[col - 1] || '';
     const r = this.rows[row - 2];
     const v = r ? r[col - 1] : undefined;
     return v === undefined ? '' : v;
@@ -84,13 +95,24 @@ const HEADERS = [
   'Сегмент', 'Зона', 'Статус', 'Дата финиша', 'Купил'
 ];
 
-const sheet = new Sheet('Ответы');
+// Листов в таблице несколько: «Ответы» и «Журнал». Заглушка обязана их
+// различать, иначе записи журнала уедут в лист ответов.
+const sheets = new Map();
+function sheetByName(name) {
+  if (!sheets.has(name)) sheets.set(name, new Sheet(name));
+  return sheets.get(name);
+}
+const sheet = sheetByName('Ответы');
+const logSheet = sheetByName('Журнал');
+
 global.SpreadsheetApp = {
   getActiveSpreadsheet: () => ({
-    getSheetByName: (n) => (n === 'Ответы' ? sheet : null),
-    insertSheet: () => sheet
+    getSheetByName: (n) => (sheets.has(n) && sheets.get(n).created ? sheets.get(n) : null),
+    insertSheet: (n) => { const s = sheetByName(n); s.created = true; return s; },
+    getSheets: () => [...sheets.values()]
   })
 };
+sheet.created = true;
 
 const propsStore = new Map([['TOKEN', 'TEST:TOKEN'], ['WEBHOOK_SECRET', 'sekret']]);
 global.PropertiesService = {
@@ -129,6 +151,17 @@ global.LockService = {
 let messageId = 500;
 function record(url, payload) {
   const method = url.split('/').pop();
+  if (method === 'getMe') {
+    state.sent.push({ method, ok: true });
+    return JSON.stringify({ ok: true, result: { username: 'test_bot' } });
+  }
+  if (method === 'getWebhookInfo') {
+    state.sent.push({ method, ok: true });
+    return JSON.stringify({ ok: true, result: state.webhookInfo || {
+      url: 'https://script.google.com/macros/s/AKfycbxI3rdvrCC9mFwi4PbFESqW9iGQY91fogZdr4afhuWsGsYX42cnLMMGJaHaXdaNqTV3/exec?s=sekret',
+      pending_update_count: 0
+    } });
+  }
   if (method === 'sendMessage' && state.failSendMessage) {
     state.sent.push({ method, text: payload.text, ok: false });
     return JSON.stringify({ ok: false, error_code: 403, description: 'bot was blocked by the user' });
@@ -139,6 +172,14 @@ function record(url, payload) {
 
 global.UrlFetchApp = {
   fetch: (url, params) => {
+    // Обращение к адресу развёртывания — это проверка «какая версия развёрнута»,
+    // а не вызов Bot API.
+    if (url.indexOf('api.telegram.org') === -1) {
+      state.deploymentFetches++;
+      if (state.liveBody === null) throw new Error('адрес недоступен');
+      const body = state.liveBody;
+      return { getContentText: () => body, getResponseCode: () => 200 };
+    }
     state.fetch++;
     const body = record(url, params.payload);
     return { getContentText: () => body, getResponseCode: () => 200 };
@@ -152,7 +193,10 @@ global.UrlFetchApp = {
   }
 };
 
-global.ContentService = { createTextOutput: (t) => ({ text: t, getContent: () => t }) };
+global.ContentService = {
+  MimeType: { TEXT: 'text/plain', JSON: 'application/json' },
+  createTextOutput: (t) => ({ text: t, getContent: () => t, setMimeType() { return this; } })
+};
 global.Utilities = {
   sleep: () => {},
   getUuid: () => '11111111-2222-3333-4444-555555555555',
@@ -167,7 +211,9 @@ global.console = {
 };
 
 function reset() {
-  sheet.rows.length = 0;
+  sheets.forEach((s) => { s.rows.length = 0; });
+  logSheet.created = false;
+  logSheet.headers = null;
   cacheStore.clear();
   [...propsStore.keys()].forEach((k) => {
     if (k !== 'TOKEN' && k !== 'WEBHOOK_SECRET') propsStore.delete(k);
@@ -179,7 +225,11 @@ function reset() {
   state.onSlowSheetWrite = null;
   state.failSendMessage = false;
   state.lockHeld = false;
-  if (typeof global._sheet !== 'undefined') global._sheet = null;
+  state.deploymentFetches = 0;
+  state.liveBody = JSON.stringify({ 'версия_кода': '4.1' });
+  state.webhookInfo = null;
+  global._sheet = null;
+  global._logSheet = null;
 }
 
-module.exports = { state, sheet, propsStore, cacheStore, reset, realLog, HEADERS };
+module.exports = { state, sheet, logSheet, propsStore, cacheStore, reset, realLog, HEADERS };
