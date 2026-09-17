@@ -15,7 +15,8 @@
     "logs": "clasp tail-logs --simplified",
     "open": "clasp open-script",
     "test:bot": "node test/run_tests.js",
-    "test:tools": "node test/test_deploy_tools.mjs"
+    "test:tools": "node test/test_deploy_tools.mjs",
+    "docs": "node scripts/gen-logic-doc.mjs"
   },
   "devDependencies": {
     "@google/clasp": "^3.4.1"
